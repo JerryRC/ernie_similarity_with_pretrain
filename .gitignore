@@ -1,5 +1,9 @@
 tmp/
+.vscode/
 
 # pycharm
 .idea/
 __pycache__/
+
+**/*.txt
+**/*.gz
