@@ -2,12 +2,15 @@
 # 本代码基于 Google AI 的 BERT 预训练数据生成代码改编。
 # 主体思想与原始代码相近，但是是基于中文文本特点与 Pytorch 环境进行改编的，
 # 用于将中文无标注文本处理为 BERT 的 masked LM/next sentence 预训练语料。
+import sys
+sys.path.append(r"/home/cjr/similarity-model/")
 import random
 import click
-from pytorch_transformers import BertTokenizer
 from loguru import logger
 import gzip
 import jieba
+from ernie.classification import tokenization
+import traceback
 
 
 class TrainingInstance(object):
@@ -69,7 +72,8 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length, output
             total_written += 1
 
     except Exception as e:
-        e.with_traceback()
+        traceback.print_exc()
+        logger.error(e)
     finally:
         fout_t.close()
         fout_e.close()
@@ -105,7 +109,9 @@ def create_training_instances(input_files, tokenizer, max_seq_length,
                 # 如果是个空行，则表示新的段落开始。
                 if not line:
                     all_documents.append([])
-                tokens = [line]
+                # 这里先不进行 tokenize 因为后续的步骤里面需要通过 jieba 进行分词，最后在进行 tokenize
+                # 也就是这里的 tokens 实际上是一个原始句子 str
+                tokens = line
                 if tokens:
                     all_documents[-1].append(tokens)
 
@@ -140,6 +146,10 @@ def create_instances_from_document(
 
     # 这里采取的策略是先预选中最大长度的几个句子片段，然后将片段以完整句子为单位随机分为 A B 两部分，
     # 如果是进入了随机下一句的 case ，则在选完 A 中的句子后，下一句从其他段落中随机挑选句子填满该 instance。
+    # 
+    # 新版：这里不再像之前一样直接拿上一层分词好的结果进行运算，而是直接操作原始的字符串了，所以以下的代码从以前的操作 token 列表变成了操作 str。
+    # 因为 jieba 分词后 tokenizer 的 token 结果可能与原始句子的 token 不一致，所以不能再在上层调用里提前分好词了。
+    # 我们现在要先用 jieba 分词，然后对分词后的 tokenize 结果生成 word_seg_labels 和 ids 并同步进行截断。
     instances = []
     current_chunk = []
     current_length = 0
@@ -156,15 +166,15 @@ def create_instances_from_document(
                 if len(current_chunk) >= 2:
                     a_end = rng.randint(1, len(current_chunk) - 1)
 
-                tokens_a = []
+                str_a = ''
                 for j in range(a_end):
-                    tokens_a.extend(current_chunk[j])
+                    str_a += current_chunk[j]
 
-                tokens_b = []
+                str_b = ''
                 # 随机的 “下一句话”
                 if len(current_chunk) == 1 or rng.random() < 0.5:
                     is_random_next = True
-                    target_b_length = target_seq_length - len(tokens_a)
+                    target_b_length = target_seq_length - len(str_a)
 
                     # 随机选取一个其他的段落以摘取一个“任意的”下一句话
                     random_document_index = rng.randint(0, len(all_documents) - 1)
@@ -176,8 +186,8 @@ def create_instances_from_document(
                     random_document = all_documents[random_document_index]
                     random_start = rng.randint(0, len(random_document) - 1)
                     for j in range(random_start, len(random_document)):
-                        tokens_b.extend(random_document[j])
-                        if len(tokens_b) >= target_b_length:
+                        str_b += random_document[j]
+                        if len(str_b) >= target_b_length:
                             break
                     # 这里由于采取了随机的下一句话，所以原本想当作第二句话的句子都可以放回去等待下一轮使用。
                     num_unused_segments = len(current_chunk) - a_end
@@ -186,42 +196,62 @@ def create_instances_from_document(
                 else:
                     is_random_next = False
                     for j in range(a_end, len(current_chunk)):
-                        tokens_b.extend(current_chunk[j])
-                truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng)
-
-                assert len(tokens_a) >= 1
-                assert len(tokens_b) >= 1
+                        str_b += current_chunk[j]
 
                 # 引入中文分词，这里简单采用 jieba 库进行分词。按照 ernie 的设计
                 # word_seg_labels 表示分词边界信息: 0表示词首、1表示非词首、-1为占位符, 其对应的词为 CLS或者 SEP
 
-                tokens = []
-                segment_ids = []
-                word_seg_labels = []
-                tokens.append("[CLS]")
-                segment_ids.append(0)
-                word_seg_labels.append(-1)
+                tokens_a = []
+                segment_ids_a = []
+                word_seg_labels_a = []
                 
-                words = list(jieba.cut(''.join(i for i in tokens_a)))
+                words = list(jieba.cut(str_a))
                 for word in words:
                     word_tokens = tokenizer.tokenize(word)
-                    word_seg_labels += [0] + [1] * (len(word_tokens) - 1)
-                for token in tokens_a:
-                    tokens.append(token)
-                    segment_ids.append(0)
+                    if len(word_tokens) > 0:
+                        word_seg_labels_a += [0] + [1] * (len(word_tokens) - 1)
+                        for token in word_tokens:
+                            tokens_a.append(token)
+                            segment_ids_a.append(0)
+                        assert len(tokens_a) == len(word_seg_labels_a), "tokens_a: {}, word_seg_labels_a: {}, word: {}".format(
+                            len(tokens_a), len(word_seg_labels_a), word)
 
+                tokens_b = []
+                segment_ids_b = []
+                word_seg_labels_b = []
+                words = list(jieba.cut(str_b))
+                for word in words:
+                    word_tokens = tokenizer.tokenize(word)
+                    if len(word_tokens) > 0:
+                        word_seg_labels_b += [0] + [1] * (len(word_tokens) - 1)
+                        for token in word_tokens:
+                            tokens_b.append(token)
+                            segment_ids_b.append(1)
+                        assert len(tokens_b) == len(word_seg_labels_b), "tokens_a: {}, word_seg_labels_a: {}, word: {}".format(
+                            len(tokens_b), len(word_seg_labels_b), word)
+
+                # 这里是同时对 A B 两个 turple 里的所以列表进行截断，保证最终的 instance 长度不超过 max_num_tokens
+                truncate_seq_pair((tokens_a,segment_ids_a,word_seg_labels_a), (tokens_b,segment_ids_b,word_seg_labels_b), max_num_tokens, rng)
+
+                assert len(tokens_a) >= 1
+                assert len(tokens_b) >= 1
+
+                tokens = ["[CLS]"]
+                segment_ids = [0]
+                word_seg_labels = [-1]
+
+                tokens += tokens_a
+                segment_ids += segment_ids_a
+                word_seg_labels += word_seg_labels_a
+                
                 tokens.append("[SEP]")
                 segment_ids.append(0)
                 word_seg_labels.append(-1)
 
-                words = list(jieba.cut(''.join(i for i in tokens_b)))
-                for word in words:
-                    word_tokens = tokenizer.tokenize(word)
-                    word_seg_labels += [0] + [1] * (len(word_tokens) - 1)
-                for token in tokens_b:
-                    tokens.append(token)
-                    segment_ids.append(1)
-
+                tokens += tokens_b
+                segment_ids += segment_ids_b
+                word_seg_labels += word_seg_labels_b
+                
                 tokens.append("[SEP]")
                 segment_ids.append(1)
                 word_seg_labels.append(-1)
@@ -239,21 +269,22 @@ def create_instances_from_document(
     return instances
 
 
-def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng):
-    """ 将两个句子修剪至总长度小于等于设定的最大长度 """
+def truncate_seq_pair(turple_a, turple_b, max_num_tokens, rng):
+    """ 
+        将两个句子修剪至总长度小于等于设定的最大长度 
+        turple 里面装的是 tokens, segment_ids, word_seg_labels
+    """
     while True:
-        total_length = len(tokens_a) + len(tokens_b)
+        total_length = len(turple_a[0]) + len(turple_b[0])
         if total_length <= max_num_tokens:
             break
 
-        trunc_tokens = tokens_a if len(tokens_a) > len(tokens_b) else tokens_b
-        assert len(trunc_tokens) >= 1
+        trunc_turple = turple_a if len(turple_a[0]) > len(turple_b[0]) else turple_b
+        assert len(trunc_turple[0]) >= 1
 
-        # 以二分之一的概率随机选择从句首或句尾截短当前句子
-        if rng.random() < 0.5:
-            del trunc_tokens[0]
-        else:
-            trunc_tokens.pop()
+        trunc_turple[0].pop()
+        trunc_turple[1].pop()
+        trunc_turple[2].pop()
 
 
 @click.command()
@@ -264,9 +295,11 @@ def truncate_seq_pair(tokens_a, tokens_b, max_num_tokens, rng):
 @click.option("--dupe_factor", default=10, help="Number of times to duplicate the input data (with different masks).")
 @click.option("--short_seq_prob", default=0.1, type=float,
               help="Probability of creating sequences which are shorter than the maximum length.")
-def main(input_file, output_file, max_seq_length, random_seed, dupe_factor, short_seq_prob):
+@click.option("--vocab_path", help="The vocabulary file that the Ernie model was trained on.")
+@click.option("--do_lower_case", default=True, type=bool, help="Whether to lower case the input text.")
+def main(input_file, output_file, max_seq_length, random_seed, dupe_factor, short_seq_prob, vocab_path, do_lower_case):
     logger.info("*** Loading the tokenizer ***")
-    tokenizer = BertTokenizer.from_pretrained("bert-base-chinese")
+    tokenizer = tokenization.FullTokenizer(vocab_file=vocab_path, do_lower_case=do_lower_case)
 
     # TODO 这里没有实现原始的给定文件 pattern 来批量匹配文件
     input_files = input_file.split(",")

@@ -58,8 +58,8 @@ def ge_model_handler(model_name):
     if model_name == "ernie":
         return ernie
     # 可以类比扩展其他模型
-    elif model_name == "xx":
-        return
+    elif model_name == "bert":
+        return bert
     else:
         log.error("model\"%s\" not found", model_name)
         return
